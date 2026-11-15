@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>오프라인 광학 QR 파일 전송</title>
+  <!-- 같은 폴더에 있는 로컬 라이브러리 로드 -->
+  <script src="./qrcode.min.js"></script>
+  <script src="./jsQR.js"></script>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 30px auto; padding: 0 20px; line-height: 1.5; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    button { padding: 10px 16px; font-size: 15px; cursor: pointer; border: 1px solid #ccc; border-radius: 6px; background: #f8f9fa; }
+    button.active { background: #007aff; color: white; border-color: #007aff; font-weight: bold; }
+    .panel { display: none; border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
+    .panel.active { display: block; }
+    #qrcode { margin: 20px auto; display: flex; justify-content: center; background: white; padding: 15px; }
+    video { width: 100%; border-radius: 8px; background: #000; margin-top: 10px; }
+    .status { margin-top: 15px; font-weight: bold; color: #333; }
+    progress { width: 100%; height: 20px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+
+  <h2>📡 오프라인 광학 QR 파일 전송</h2>
+
+  <div class="tabs">
+    <button id="tabSend" class="active" onclick="switchTab('send')">1. 파일 보내기 (송신)</button>
+    <button id="tabRecv" onclick="switchTab('recv')">2. 파일 받기 (수신)</button>
+  </div>
+
+  <!-- [송신 패널] -->
+  <div id="panelSend" class="panel active">
+    <p>전송할 파일을 선택하면 QR코드가 연속으로 재생됩니다.</p>
+    <input type="file" id="fileInput" />
+    <div style="margin-top: 10px;">
+      속도 조절: 
+      <select id="speedSelect">
+        <option value="150">보통 (초당 약 6.6장 - 추천)</option>
+        <option value="100">빠름 (초당 10장)</option>
+        <option value="250">느림 (초당 4장 - 초점 잘 안맞을 때)</option>
+      </select>
+    </div>
+    <div id="sendStatus" class="status">대기 중...</div>
+    <div id="qrcode"></div>
+  </div>
+
+  <!-- [수신 패널] -->
+  <div id="panelRecv" class="panel">
+    <p>카메라 권한을 허용한 뒤 상대방 화면의 QR코드를 비춰주세요.</p>
+    <button onclick="startCamera()">📷 카메라 켜기 및 스캔 시작</button>
+    <div id="recvStatus" class="status">카메라 대기 중...</div>
+    <progress id="recvProgress" value="0" max="100"></progress>
+    <video id="video" playsinline></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+  <script>
+    // 탭 전환
+    function switchTab(mode) {
+      document.getElementById('tabSend').classList.toggle('active', mode === 'send');
+      document.getElementById('tabRecv').classList.toggle('active', mode === 'recv');
+      document.getElementById('panelSend').classList.toggle('active', mode === 'send');
+      document.getElementById('panelRecv').classList.toggle('active', mode === 'recv');
+    }
+
+    /* ==========================================
+       1. 송신 로직 (파일 -> 청크 분할 -> QR 애니메이션)
+       ========================================== */
+    let sendTimer = null;
+    const qrContainer = document.getElementById('qrcode');
+    let qr = null;
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      if (sendTimer) clearInterval(sendTimer);
+      qrContainer.innerHTML = '';
+
+      // QR 객체 생성 (오류복원 L등급으로 데이터 용량 극대화)
+      qr = new QRCode(qrContainer, {
+        width: 340,
+        height: 340,
+        correctLevel: QRCode.CorrectLevel.L
+      });
+
+      const buffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      const fileName = encodeURIComponent(file.name);
+
+      // 한 장당 550바이트 (웹캠 인식률과 속도의 최적 균형점)
+      const CHUNK_SIZE = 550;
+      const totalChunks = Math.ceil(bytes.length / CHUNK_SIZE);
+      let idx = 0;
+
+      const intervalMs = Number(document.getElementById('speedSelect').value);
+
+      sendTimer = setInterval(() => {
+        const start = idx * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, bytes.length);
+        const chunk = bytes.slice(start, end);
+
+        let binary = '';
+        for (let i = 0; i < chunk.byteLength; i++) {
+          binary += String.fromCharCode(chunk[i]);
+        }
+        const b64 = btoa(binary);
+
+        // 헤더 포맷: "현재인덱스|전체개수|파일명|Base64데이터"
+        const payload = `${idx}|${totalChunks}|${fileName}|${b64}`;
+        
+        qr.clear();
+        qr.makeCode(payload);
+
+        document.getElementById('sendStatus').innerText = 
+          `송신 중: ${idx + 1} / ${totalChunks} 조각 (${file.name})`;
+
+        idx = (idx + 1) % totalChunks; // 무한 루프 재생
+      }, intervalMs);
+    });
+
+    /* ==========================================
+       2. 수신 로직 (카메라 -> jsQR -> IndexedDB -> 조립)
+       ========================================== */
+    const DB_NAME = 'OpticalQR_DB';
+    const STORE_NAME = 'chunks';
+    let db = null;
+    let receivedSet = new Set();
+    let expectedTotal = 0;
+    let targetFileName = 'download.bin';
+    let isCompleted = false;
+
+    // IndexedDB 초기화
+    function initDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = (e) => {
+          const database = e.target.result;
+          if (!database.objectStoreNames.contains(STORE_NAME)) {
+            database.createObjectStore(STORE_NAME);
+          }
+        };
+        req.onsuccess = (e) => {
+          db = e.target.result;
+          // 기존 잔여 데이터 초기화
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          tx.objectStore(STORE_NAME).clear();
+          tx.oncomplete = () => resolve();
+        };
+        req.onerror = (e) => reject(e);
+      });
+    }
+
+    // IndexedDB에 청크 저장
+    function saveChunkToDB(index, uint8Array) {
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        tx.objectStore(STORE_NAME).put(uint8Array, index);
+        tx.oncomplete = () => resolve();
+      });
+    }
+
+    // 카메라 시작 및 스캔 루프
+    async function startCamera() {
+      await initDB();
+      receivedSet.clear();
+      expectedTotal = 0;
+      isCompleted = false;
+
+      const video = document.getElementById('video');
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      document.getElementById('recvStatus').innerText = '스캔 중... QR코드를 화면 중앙에 맞춰주세요.';
+
+      function scanFrame() {
+        if (isCompleted) return;
+
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert'
+          });
+
+          if (code && code.data) {
+            handleQRData(code.data);
+          }
+        }
+        requestAnimationFrame(scanFrame);
+      }
+      requestAnimationFrame(scanFrame);
+    }
+
+    // 인식된 QR 텍스트 파싱 및 DB 저장
+    async function handleQRData(rawText) {
+      const parts = rawText.split('|');
+      if (parts.length !== 4) return;
+
+      const idx = parseInt(parts[0], 10);
+      const total = parseInt(parts[1], 10);
+      const fileName = decodeURIComponent(parts[2]);
+      const b64 = parts[3];
+
+      if (isNaN(idx) || isNaN(total)) return;
+
+      // 새 파일 전송 감지 시 초기화
+      if (expectedTotal !== total) {
+        expectedTotal = total;
+        targetFileName = fileName;
+        receivedSet.clear();
+      }
+
+      // 이미 받은 조각이면 무시
+      if (receivedSet.has(idx)) return;
+      receivedSet.add(idx);
+
+      // Base64 -> Uint8Array 복원
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+
+      await saveChunkToDB(idx, bytes);
+
+      // 진행률 업데이트
+      const percent = Math.round((receivedSet.size / expectedTotal) * 100);
+      document.getElementById('recvProgress').value = percent;
+      document.getElementById('recvStatus').innerText = 
+        `수신 중 (${targetFileName}): ${receivedSet.size} / ${expectedTotal} (${percent}%)`;
+
+      // 모든 조각 수집 완료 시 파일 조립
+      if (receivedSet.size === expectedTotal) {
+        isCompleted = true;
+        assembleAndDownload();
+      }
+    }
+
+    // IndexedDB에서 전체 조각을 꺼내 파일로 다운로드
+    function assembleAndDownload() {
+      document.getElementById('recvStatus').innerText = '✅ 수신 완료! 파일 조립 중...';
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const chunks = new Array(expectedTotal);
+      let loaded = 0;
+
+      for (let i = 0; i < expectedTotal; i++) {
+        const req = store.get(i);
+        req.onsuccess = (e) => {
+          chunks[i] = e.target.result;
+          loaded++;
+          if (loaded === expectedTotal) {
+            const blob = new Blob(chunks, { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = targetFileName;
+            a.click();
+            URL.revokeObjectURL(url);
+            document.getElementById('recvStatus').innerText = `🎉 다운로드 완료: ${targetFileName}`;
+          }
+        };
+      }
+    }
+  </script>
+</body>
+</html>
